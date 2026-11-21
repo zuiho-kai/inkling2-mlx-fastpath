@@ -1,4 +1,4 @@
-# 录真实逐 token 时间戳：同一提示词、同一进程，先默认做法再我们的做法（各预热一次），写 trace.json
+# Record real per-token timestamps: same prompt, same process, stock then the fast path (one warm-up each) -> trace.json
 import sys, time, json, importlib.util
 import mlx.core as mx
 from mlx_lm import load, stream_generate
@@ -14,7 +14,7 @@ def run():
         ev.append([time.perf_counter() - t0, r.token, r.text]); last = r
     return dict(events=ev, decode_tps=last.generation_tps, prefill_tps=last.prompt_tps, n=last.generation_tokens)
 run(); base = run()
-sys.path.insert(0, cand); import inkling2_fastpath as m  # cand = 新仓目录，用发布的包本身
+sys.path.insert(0, cand); import inkling2_fastpath as m  # cand = this repo dir: records the published package itself
 m.enable(model); run(); ours = run(); m.revert(model)
 same = [e[1] for e in base["events"]] == [e[1] for e in ours["events"]]
 json.dump(dict(prompt=PROMPT, base=base, ours=ours, same_tokens=same, chip="Apple M5 Max", model="Inkling 2 Mini (MLX 4-bit)"), open(out, "w"))

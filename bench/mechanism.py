@@ -1,5 +1,6 @@
-# 机制证据：解码一步里「Python 建图」和整步耗时各多少；编译候选应主要减少建图时间（少发小算子）
-# 用法: python mechanism.py <模型目录> [候选.py]
+# Mechanism check: per decode step, time spent building the lazy graph in Python vs the whole step.
+# A compile candidate should cut graph-building time (fewer small ops) and GPU time (fused kernels).
+# Usage: python mechanism.py <model-dir> [candidate.py]
 import sys, time, importlib.util, statistics
 import mlx.core as mx
 from mlx_lm import load
@@ -13,7 +14,7 @@ ids = mx.array(tok.encode("def lru_cache(capacity):"))[None]
 cache = make_prompt_cache(model); out = model(ids, cache=cache); mx.eval(out)
 y = mx.argmax(out[:, -1:], -1)
 build, total = [], []
-for i in range(60):  # 60 步，前 10 步当预热丢掉（首步含编译）
+for i in range(60):  # 60 steps; the first 10 are warm-up (the first includes compilation)
     t0 = time.perf_counter(); out = model(y, cache=cache); t1 = time.perf_counter()
     y = mx.argmax(out[:, -1:], -1); mx.eval(y); t2 = time.perf_counter()
     if i >= 10: build.append(t1 - t0); total.append(t2 - t0)

@@ -1,4 +1,4 @@
-# 用 trace.json 里的真实时间戳逐帧回放：左默认、右我们的，画面显示实时 tok/s；ffmpeg 出 mp4
+# Replay real per-token timestamps from trace.json frame by frame: stock left, fast path right, live tok/s; ffmpeg to mp4.
 import sys, json, subprocess, os, re, shutil
 from PIL import Image, ImageDraw, ImageFont
 tr = json.load(open(sys.argv[1])); outmp4 = sys.argv[2]; fps = 30
@@ -15,7 +15,7 @@ def state(ev, t):
     text = re.sub(r"<\|[a-z_]+\|>", "", "".join(e[2] for e in done)).lstrip("\n")
     n = len(done)
     if n >= 2:
-        # 从第一个 token 起算的解码速度（不含首 token 前的预填充）
+        # decode speed counted from the first token (prefill excluded)
         tps = (n - 1) / max(done[-1][0] - ev[0][0], 1e-6) if t < ev[-1][0] else (len(ev) - 1) / (ev[-1][0] - ev[0][0])
     else:
         tps = 0.0

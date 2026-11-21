@@ -1,16 +1,16 @@
-# infer-rsi 在 Mac 上的一轮：同一进程载入模型一次，候选策略和默认做法交替跑，按实测解码速度打分。
-# 用法: venv-mlx/bin/python rsi/rsi_mlx.py <模型目录> <轮次目录> --max-tokens N --reps R
-#   轮次目录/cands/*.py 每个文件是一个候选策略，需定义 apply(model) -> dict（返回传给 stream_generate 的参数），
-#   可以就地改模型（换算子、包 mx.compile 等），并定义 revert(model) 撤回。
-# 打分：解码 tok/s 中位数；门槛：贪心输出 token 序列必须与默认做法完全一致（不改结果才算提速）。
-# 噪音：默认做法在每个候选前后都跑，取默认做法自身的跑间极差当噪音口径。
+# One InferRSI-style round on a Mac: load the model once, alternate each candidate with the default path, score by measured decode speed.
+# Usage: python rsi_mlx.py <model-dir> <round-dir> --split evolve|holdout --max-tokens N --reps R
+#   Each <round-dir>/cands/*.py (not starting with "_") is a candidate defining apply(model) -> dict of stream_generate kwargs;
+#   it may patch the model in place (swap ops, wrap mx.compile) and defines revert(model).
+# Score: median paired ratio candidate/adjacent-default decode tok/s. Gate: greedy token ids identical to the default path.
+# Noise: range of the default path's own runs. Below 5% difference: no conclusion.
 import argparse, glob, importlib.util, json, os, statistics, time
 import mlx.core as mx
 from mlx_lm import load, stream_generate
 from mlx_lm.sample_utils import make_sampler
 
-# 代码生成负载（交接验收「真跑出一段代码生成」）。切分验证（沿用 infer-rsi 口径）：
-# evolve 份用来选候选，holdout 份只在最后给留下的候选考一次，报数以 holdout 为准。
+# Code-generation workload. Split validation, as in earlier InferRSI campaigns:
+# candidates are selected on "evolve"; the reported number is the "holdout" split.
 SPLITS = {
     "evolve": [
         "用 Python 写一个线程安全的 LRU 缓存类，支持 get/put/容量上限和过期时间（TTL），附 3 个 pytest 用例。只输出代码。",
@@ -59,7 +59,7 @@ log = open(os.path.join(a.round_dir, f"log-{a.split}.jsonl"), "a")
 def emit(d):
     print(json.dumps(d, ensure_ascii=False), flush=True); log.write(json.dumps(d, ensure_ascii=False) + "\n"); log.flush()
 
-run_once({})  # 预热：首次跑含 Metal 内核编译，不计分
+run_once({})  # warm-up: the first pass compiles Metal kernels; not scored
 base_runs = [run_once({})]
 ref_ids = [x["ids"] for x in base_runs[0]]
 results = {}
@@ -72,10 +72,10 @@ for path in cands:
     runs = []; pairs = []; same = True; err = None
     try:
         for i in range(a.reps):
-            base_runs.append(run_once({}))           # 默认做法，与候选交替
+            base_runs.append(run_once({}))           # default path, alternated with the candidate
             kw = mod.apply(model)
             r = run_once(kw); runs.append(r)
-            pairs.append(summary([r])["dec_med"] / summary([base_runs[-1]])["dec_med"])  # 配对：比紧挨着的那次默认做法，抵掉升温漂移
+            pairs.append(summary([r])["dec_med"] / summary([base_runs[-1]])["dec_med"])  # paired with the adjacent default run, cancelling thermal drift
             if hasattr(mod, "revert"): mod.revert(model)
             same = same and all(x["ids"] == ref for x, ref in zip(r, ref_ids))
     except Exception as e:
@@ -91,11 +91,11 @@ emit(dict(cand="baseline", **b, noise_range=noise))
 for n, r in results.items():
     if r.get("dec_med"):
         r["speedup"] = statistics.median(r["paired"])
-        r["verdict"] = ("改了输出，淘汰" if not r["same_output"] else
-                        "差距<5%，不下结论" if abs(r["speedup"] - 1) < 0.05 else
-                        "留" if r["speedup"] > 1 else "淘汰")
+        r["verdict"] = ("output changed: rejected" if not r["same_output"] else
+                        "<5%: no conclusion" if abs(r["speedup"] - 1) < 0.05 else
+                        "keep" if r["speedup"] > 1 else "reject")
 json.dump(dict(baseline=b, noise_range=noise, cands=results), open(os.path.join(a.round_dir, f"score-{a.split}.json"), "w"),
           ensure_ascii=False, indent=1)
 for n, r in sorted(results.items(), key=lambda kv: -kv[1].get("dec_med", 0)):
-    print(f"{n:24s} {r.get('dec_med', 0):7.2f} tok/s  x{r.get('speedup', 0):.3f}  同输出={r['same_output']}  {r.get('verdict')}  {r['err'] or ''}")
-print(f"baseline {b['dec_med']:.2f} tok/s  跑间极差 {noise:.1%}")
+    print(f"{n:24s} {r.get('dec_med', 0):7.2f} tok/s  x{r.get('speedup', 0):.3f}  same_output={r['same_output']}  {r.get('verdict')}  {r['err'] or ''}")
+print(f"baseline {b['dec_med']:.2f} tok/s  noise range {noise:.1%}")

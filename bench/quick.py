@@ -1,4 +1,4 @@
-# 快检：候选和默认做法各生成 N 个 token，比 token 是否一致、粗测速度（正式分数以 rsi_mlx.py 为准）
+# Quick check: candidate vs stock, N tokens each: same token ids? rough speed (scores come from rsi_mlx.py).
 import sys, time, importlib.util
 import mlx.core as mx
 from mlx_lm import load, stream_generate
