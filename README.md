@@ -87,7 +87,7 @@ python demo/record.py <model-dir> . 400 demo/trace.json && python demo/render.py
 ```
 
 Run nothing else on the GPU meanwhile. `rounds/r1`–`r4` hold every candidate and the JSONL/JSON each round wrote
-(comments inside the round files are in Chinese; the code is the code that was measured).
+(the code is the code that was measured; comments translated afterwards).
 
 ## How it was found
 
