@@ -42,13 +42,14 @@ def _proj(self, attn, qi, ki, vi, same_kv):
     if OPTS["fuse_proj"]:
         f = _fused.get(id(attn))
         if f is not None:
-            outs = f["qrgs"](qi)
-            qp, rp, gate, sinks = mx.split(outs, f["qrgs_split"], axis=-1)
-            if same_kv and OPTS["fuse_all6"]:  # sliding layer, no messages: q/k/v share the input
+            if same_kv and OPTS["fuse_all6"] and "all6" in f:  # sliding layer, no messages: q/k/v share the input
                 qp, kp, vp, rp, gate, sinks = mx.split(f["all6"](qi), f["all6_split"], axis=-1)
                 return qp, kp, vp, rp, gate, sinks
-            kp = attn.k_proj(ki); vp = attn.v_proj(vi)
-            return qp, kp, vp, rp, gate, sinks
+            if "qrgs" in f:
+                outs = f["qrgs"](qi)
+                qp, rp, gate, sinks = mx.split(outs, f["qrgs_split"], axis=-1)
+                kp = attn.k_proj(ki); vp = attn.v_proj(vi)
+                return qp, kp, vp, rp, gate, sinks
     return attn.q_proj(qi), attn.k_proj(ki), attn.v_proj(vi), attn.r_proj(qi), attn.gate_proj(qi), attn.sink_proj(qi)
 
 
@@ -57,7 +58,7 @@ _CONV_SRC = """
     uint c = thread_position_in_grid.x;
     if (c >= (uint)C) return;
     float xs[4];
-    for (int k = 0; k < 3; ++k) xs[k] = state[k * C + c];
+    for (int k = 0; k < 3; ++k) xs[k] = static_cast<float>(state[k * C + c]);
     float xr = static_cast<float>(x[c]);
     xs[3] = xr;
     float acc = 0.0f;
@@ -65,7 +66,7 @@ _CONV_SRC = """
     WT o = static_cast<WT>(acc);
     float r = (static_cast<float>(o) + xr) / 2.2360679774997896f;
     out[c] = static_cast<OT>(r);
-    for (int k = 0; k < 3; ++k) new_state[k * C + c] = xs[k + 1];
+    for (int k = 0; k < 3; ++k) new_state[k * C + c] = static_cast<ST>(xs[k + 1]);
 """
 _conv_k = None
 
@@ -78,8 +79,8 @@ def _sconv(conv, x, st):
             _conv_k = mx.fast.metal_kernel(name="ink_sconv", input_names=["x", "state", "w"],
                                            output_names=["out", "new_state"], source=_CONV_SRC)
         C = x.shape[-1]; w = conv.conv1d.weight
-        o, ns = _conv_k(inputs=[x, st, w], template=[("C", C), ("WT", w.dtype), ("OT", x.dtype)], grid=(C, 1, 1),
-                        threadgroup=(256, 1, 1), output_shapes=[x.shape, st.shape], output_dtypes=[x.dtype, mx.float32])
+        o, ns = _conv_k(inputs=[x, st, w], template=[("C", C), ("WT", w.dtype), ("OT", x.dtype), ("ST", st.dtype)], grid=(C, 1, 1),
+                        threadgroup=(256, 1, 1), output_shapes=[x.shape, st.shape], output_dtypes=[x.dtype, st.dtype])
         return o, ns
     o, win = conv(x, st, None)
     return o, win[:, 1:]
@@ -256,11 +257,24 @@ def call(self, hidden_states, block_states, *, cache=None, conv_mask=None, messa
     return hs, bs
 
 
+def _compatible_quant(ps):
+    if not all(isinstance(p, nn.QuantizedLinear) for p in ps):
+        return False
+    specs = {
+        (p.bits, p.group_size, getattr(p, "mode", "affine"), p.get("biases") is not None)
+        for p in ps
+    }
+    return len(specs) == 1
+
+
 def _cat_q(ps):
     f = nn.QuantizedLinear.__new__(nn.QuantizedLinear); nn.Module.__init__(f)
     f.group_size, f.bits, f.mode = ps[0].group_size, ps[0].bits, getattr(ps[0], "mode", "affine")
     f.weight = mx.concatenate([p.weight for p in ps]); f.scales = mx.concatenate([p.scales for p in ps])
-    f.biases = mx.concatenate([p.biases for p in ps])
+    if ps[0].get("biases") is not None:
+        f.biases = mx.concatenate([p.biases for p in ps])
+    else:
+        f.biases = None
     f.freeze(); mx.eval(f.parameters())
     sizes = [p.weight.shape[0] for p in ps]
     return f, [sum(sizes[:i + 1]) for i in range(len(ps) - 1)]
@@ -271,10 +285,14 @@ def _fuse(model):
         a = layer.self_attn
         if id(a) in _fused: continue
         ps = [a.q_proj, a.r_proj, a.gate_proj, a.sink_proj]
-        if not all(isinstance(p, nn.QuantizedLinear) for p in ps): continue
-        d = _fused[id(a)] = {}
-        d["qrgs"], d["qrgs_split"] = _cat_q(ps)
-        d["all6"], d["all6_split"] = _cat_q([a.q_proj, a.k_proj, a.v_proj, a.r_proj, a.gate_proj, a.sink_proj])
+        all6 = [a.q_proj, a.k_proj, a.v_proj, a.r_proj, a.gate_proj, a.sink_proj]
+        d = {}
+        if _compatible_quant(ps):
+            d["qrgs"], d["qrgs_split"] = _cat_q(ps)
+        if _sliding(layer) and _compatible_quant(all6):
+            d["all6"], d["all6_split"] = _cat_q(all6)
+        if d:
+            _fused[id(a)] = d
 
 
 # ---- message gate: forget/message projections share the input -> one matmul ----
@@ -330,7 +348,8 @@ def apply(model, **opts):
 
 
 def revert(model):
-    L.DecoderLayer.__call__ = _orig; _cache.clear()
+    L.DecoderLayer.__call__ = _orig
+    _cache.clear(); _fused.clear(); _msgw.clear(); _bw.clear()
     L.MessageGate.__call__ = _orig_msg; L.ShortConvolution.__call__ = _orig_conv
 
 
