@@ -1,3 +1,4 @@
+# Count op nodes in one decode-step graph (total and non-view, the latter ~ GPU kernels); an optional candidate file is applied first.
 import sys, collections, re, importlib.util
 import mlx.core as mx
 from mlx_lm import load
